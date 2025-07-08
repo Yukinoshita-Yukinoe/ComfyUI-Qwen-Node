@@ -7,6 +7,7 @@ import requests # Required for making HTTP requests
 from PIL import Image
 import io
 import base64
+import math # Import math module for isnan and isinf checks
 
 # 尝试从父目录导入工具函数，如果失败则使用本地/占位符版本
 # This attempts to import utility functions from a parent directory.
@@ -53,7 +54,8 @@ def comfy_image_to_base64(image_tensor: torch.Tensor, max_dimension: int = None)
     image_pil = Image.fromarray(image_tensor.cpu().numpy(), mode)
 
     # Resize image if max_dimension is specified and exceeded
-    if max_dimension and max_dimension > 0 and (image_pil.width > max_dimension or image_pil.height > max_dimension):
+    # Only resize if max_dimension is a positive number
+    if max_dimension is not None and max_dimension > 0 and (image_pil.width > max_dimension or image_pil.height > max_dimension):
         print(f"[QwenAPILLMNode] Resizing image from {image_pil.width}x{image_pil.height} to fit within {max_dimension}x{max_dimension}")
         # Calculate new dimensions while maintaining aspect ratio
         ratio = min(max_dimension / image_pil.width, max_dimension / image_pil.height)
@@ -65,6 +67,10 @@ def comfy_image_to_base64(image_tensor: torch.Tensor, max_dimension: int = None)
     buffered = io.BytesIO()
     image_pil.save(buffered, format="PNG") # PNG is a good default for base64
     base64_string = base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+    # Add debug print for base64 string length
+    print(f"[QwenAPILLMNode] Generated Base64 image string length: {len(base64_string)} characters")
+
     # Prepend the Data URI scheme
     return f"data:image/png;base64,{base64_string}"
 
@@ -132,6 +138,23 @@ class QwenAPILLMNode:
             except ValueError:
                 return ("", False, "Invalid value for max_retries. Must be an integer.\nmax_retries 的值无效。必须是整数。")
 
+        # Ensure max_image_dimension is an integer. Handle NaN or other non-integer inputs.
+        # If it's NaN or cannot be converted to int, default to 1024.
+        if isinstance(max_image_dimension, (float, str)):
+            if isinstance(max_image_dimension, float) and (math.isnan(max_image_dimension) or math.isinf(max_image_dimension)):
+                max_image_dimension = 1024 # Default for NaN/Inf
+            elif isinstance(max_image_dimension, str) and not max_image_dimension.strip():
+                max_image_dimension = 1024 # Default for empty string
+            else:
+                try:
+                    max_image_dimension = int(max_image_dimension)
+                except ValueError:
+                    max_image_dimension = 1024 # Default for other invalid string inputs
+        # Ensure it's within valid range if it's an integer
+        if not (0 <= max_image_dimension <= 4096):
+            print(f"[QwenAPILLMNode] Warning: max_image_dimension {max_image_dimension} is out of valid range [0, 4096]. Setting to default 1024.")
+            max_image_dimension = 1024 # Ensure it's within defined min/max
+
         # If API key is not provided directly, try to get it from environment variable
         if not api_key:
             api_key = os.getenv("DASHSCOPE_API_KEY")
@@ -166,6 +189,7 @@ class QwenAPILLMNode:
                 return ("", False, f"Image input provided, but '{model}' is not a multimodal model (e.g., qwen-vl-plus). Please select a VL model.\n提供了图像输入，但 '{model}' 不是多模态模型（例如 qwen-vl-plus）。请选择一个VL模型。")
             try:
                 # Convert ComfyUI image tensor to Base64, with resizing and Data URI prefix
+                # Pass max_image_dimension to the helper function
                 image_data_uri = comfy_image_to_base64(image_input, max_dimension=max_image_dimension)
                 # Wrap the Data URI in a 'url' field within the 'image' object as required by Qwen-VL API
                 user_content_parts.append({"image": {"url": image_data_uri}})
