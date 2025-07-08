@@ -30,7 +30,8 @@ except ImportError:
 
 def tensor_to_base64(tensor):
     """
-    Converts a ComfyUI image tensor to a Base64 encoded string.
+    Converts a ComfyUI image tensor to a Base64 encoded string with the
+    required data URI scheme for the Qwen API.
     The tensor is expected to be in the format (batch, height, width, channels)
     with float values in the range [0, 1].
     """
@@ -51,7 +52,10 @@ def tensor_to_base64(tensor):
     pil_image.save(buffered, format="JPEG") # Use JPEG for smaller size, PNG is also an option
     
     # Encode the byte buffer to Base64
-    return base64.b64encode(buffered.getvalue()).decode('utf-8')
+    base64_string = base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+    # *** FIX: Prepend the data URI scheme required by the API ***
+    return f"data:image/jpeg;base64,{base64_string}"
 
 class QwenAPILLMNode:
     """
@@ -151,8 +155,9 @@ class QwenAPILLMNode:
                     
                     # Check for errors in the response body
                     if "output" not in response_data or "choices" not in response_data["output"]:
+                        error_code = response_data.get("code", "UnknownError")
                         error_msg = response_data.get("message", "Invalid response structure from API.")
-                        raise Exception(error_msg)
+                        raise Exception(f"API Error [{error_code}]: {error_msg}")
 
                     generated_text = response_data["output"]["choices"][0]["message"]["content"][0]["text"]
                     status_message = f"Success (HTTP {response.status_code})"
