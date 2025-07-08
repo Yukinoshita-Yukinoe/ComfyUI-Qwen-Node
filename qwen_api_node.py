@@ -37,24 +37,13 @@ def tensor_to_base64(tensor):
     """
     if tensor is None:
         return None
-    # Squeeze the batch dimension if it's 1
     if tensor.dim() == 4 and tensor.shape[0] == 1:
         tensor = tensor.squeeze(0)
-    
-    # Convert tensor to numpy array and scale to 0-255
     image_np = (tensor.cpu().numpy() * 255).astype(np.uint8)
-    
-    # Convert numpy array to PIL Image
     pil_image = Image.fromarray(image_np)
-    
-    # Save PIL Image to a byte buffer
     buffered = io.BytesIO()
-    pil_image.save(buffered, format="JPEG") # Use JPEG for smaller size, PNG is also an option
-    
-    # Encode the byte buffer to Base64
+    pil_image.save(buffered, format="JPEG")
     base64_string = base64.b64encode(buffered.getvalue()).decode('utf-8')
-
-    # *** FIX: Prepend the data URI scheme required by the API ***
     return f"data:image/jpeg;base64,{base64_string}"
 
 class QwenAPILLMNode:
@@ -63,19 +52,32 @@ class QwenAPILLMNode:
     It supports both text-only and multimodal (vision-language) models by dynamically
     selecting the correct API endpoint.
     """
-    # Define input types for the node
     @classmethod
     def INPUT_TYPES(s):
+        # Updated model list based on the latest Aliyun documentation.
+        model_list = [
+            "qwen-plus-latest", # Added model that supports 'thinking'
+            "qwen-vl-max", 
+            "qwen-vl-plus", 
+            "qwen-max", 
+            "qwen-max-longcontext", 
+            "qwen-plus", 
+            "qwen-turbo", 
+            "qwen-long", 
+            "qwen-audio-turbo"
+        ]
         return {
             "required": {
                 "api_key": ("STRING", {"default": "", "multiline": False, "dynamicPrompts": False}),
-                "model": (["qwen-vl-max", "qwen-vl-plus", "qwen-plus", "qwen-turbo", "qwen-max", "qwen-max-longcontext"], {"default": "qwen-vl-plus"}),
-                "prompt": ("STRING", {"default": "Describe this image in detail.", "multiline": True, "dynamicPrompts": True}),
+                "model": (model_list, {"default": "qwen-plus-latest"}),
+                "prompt": ("STRING", {"default": "Solve this math problem: 1024 * 1024", "multiline": True, "dynamicPrompts": True}),
                 "system_message": ("STRING", {"default": "You are a helpful assistant.", "multiline": True, "dynamicPrompts": False}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                "temperature": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "max_tokens": ("INT", {"default": 1500, "min": 1, "max": 8000, "step": 1}),
+                "enable_search": ("BOOLEAN", {"default": False, "label_on": "enabled", "label_off": "disabled"}),
+                "enable_thinking": ("BOOLEAN", {"default": True, "label_on": "enabled", "label_off": "disabled"}), # Added thinking toggle
                 "max_retries": ("INT", {"default": 1, "min": 1, "max": 5, "step": 1}),
             },
             "optional": {
@@ -83,30 +85,26 @@ class QwenAPILLMNode:
             }
         }
 
-    # Define return types and names for the node
     RETURN_TYPES = ("STRING", "STRING", "BOOLEAN")
     RETURN_NAMES = ("generated_text", "status_message", "is_success")
     FUNCTION = "execute_qwen_request"
     CATEGORY = "Lumi/LLM"
 
-    def execute_qwen_request(self, api_key, model, prompt, system_message, seed, temperature, top_p, max_tokens, max_retries, image_input=None):
-        # --- 1. Get API Key ---
-        # Prioritize the key from the input field, then fall back to environment variables.
+    def execute_qwen_request(self, api_key, model, prompt, system_message, seed, temperature, top_p, max_tokens, enable_search, enable_thinking, max_retries, image_input=None):
         final_api_key = api_key if api_key else get_api_key("DASHSCOPE_API_KEY")
         if not final_api_key:
-            return ("", "API Key is missing. Please provide it in the node or set DASHSCOPE_API_KEY environment variable.", False)
+            return ("", "API Key is missing.", False)
 
-        # --- 2. Determine API URL and Validate Inputs ---
-        # The core fix: select the URL based on the model name.
         is_vl_model = 'vl' in model.lower()
         api_url = QWEN_MULTIMODAL_API_URL if is_vl_model else QWEN_TEXT_API_URL
 
         if is_vl_model and image_input is None:
             return ("", f"Model '{model}' is a vision-language model, but no image was provided.", False)
         if not is_vl_model and image_input is not None:
-            return ("", f"Model '{model}' is a text-only model and cannot process images. Please use a 'vl' model.", False)
+            return ("", f"Model '{model}' cannot process images. Please use a 'vl' model.", False)
+        if enable_thinking and model != 'qwen-plus-latest':
+            return ("", f"Enable Thinking (Code Interpreter) is only supported for 'qwen-plus-latest' model.", False)
 
-        # --- 3. Construct Headers and Parameters ---
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {final_api_key}"
@@ -117,23 +115,20 @@ class QwenAPILLMNode:
             "top_p": top_p,
             "max_tokens": max_tokens,
             "seed": random.randint(1, 10000) if seed == 0 else seed,
+            "enable_search": enable_search,
         }
 
-        # --- 4. Construct Payload (Messages) ---
-        # This logic correctly builds the payload for either text-only or multimodal requests.
         messages = []
         if system_message:
             messages.append({"role": "system", "content": [{"text": system_message}]})
 
         user_content = []
-        if image_input is not None:
+        if is_vl_model and image_input is not None:
             try:
                 base64_image = tensor_to_base64(image_input)
                 user_content.append({"image": base64_image})
             except Exception as e:
-                error_message = f"Failed to convert image to Base64: {e}"
-                print(f"[QwenAPILLMNode] {error_message}")
-                return ("", error_message, False)
+                return ("", f"Failed to convert image to Base64: {e}", False)
         
         user_content.append({"text": prompt})
         messages.append({"role": "user", "content": user_content})
@@ -144,28 +139,44 @@ class QwenAPILLMNode:
             "parameters": params
         }
         
-        # --- 5. Execute API Request with Retries ---
+        # --- Add 'tools' parameter if 'enable_thinking' is True for the correct model ---
+        if enable_thinking and model == 'qwen-plus-latest':
+            payload['tools'] = [{"type": "code_interpreter"}]
+            # 'result_format' must be 'message' when using tools
+            payload['parameters']['result_format'] = 'message'
+
         for attempt in range(max_retries):
             print(f"[QwenAPILLMNode] Sending request to Qwen API ({api_url}) (Attempt {attempt + 1}/{max_retries})")
             try:
                 with requests.post(api_url, headers=headers, json=payload, stream=False) as response:
-                    response.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
-                    
+                    response.raise_for_status()
                     response_data = response.json()
                     
-                    # Check for errors in the response body
-                    if "output" not in response_data or "choices" not in response_data["output"]:
+                    if "output" not in response_data or "choices" not in response_data["output"] or not response_data["output"]["choices"]:
                         error_code = response_data.get("code", "UnknownError")
                         error_msg = response_data.get("message", "Invalid response structure from API.")
                         raise Exception(f"API Error [{error_code}]: {error_msg}")
 
-                    generated_text = response_data["output"]["choices"][0]["message"]["content"][0]["text"]
+                    content_list = response_data["output"]["choices"][0]["message"]["content"]
+                    generated_text = ""
+                    if isinstance(content_list, list):
+                        for item in content_list:
+                            if "text" in item:
+                                generated_text = item["text"]
+                                break
+                    elif isinstance(content_list, str):
+                         generated_text = content_list
+
+                    if not generated_text and response_data["output"]["choices"][0].get("finish_reason") == "tool_calls":
+                        generated_text = "Model used a tool (e.g. Code Interpreter). Check logs for details."
+                    elif not generated_text:
+                         raise Exception("No text content found in the response.")
+
                     status_message = f"Success (HTTP {response.status_code})"
                     print(f"[QwenAPILLMNode] {status_message}")
                     return (generated_text, status_message, True)
 
             except requests.exceptions.RequestException as e:
-                # This catches network errors, timeouts, and HTTPError
                 status_code = e.response.status_code if e.response is not None else "N/A"
                 error_text = e.response.text if e.response is not None else str(e)
                 error_message = f"Request failed with status {status_code}. Response: {error_text}"
@@ -177,13 +188,7 @@ class QwenAPILLMNode:
                 else:
                     return ("", error_message, False)
         
-        # This should not be reached if max_retries >= 1
         return ("", "An unknown error occurred after all retries.", False)
 
-# ComfyUI-specific mappings
-NODE_CLASS_MAPPINGS = {
-    "QwenAPILLMNode": QwenAPILLMNode
-}
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "QwenAPILLMNode": "Qwen API (Lumi)"
-}
+NODE_CLASS_MAPPINGS = {"QwenAPILLMNode": QwenAPILLMNode}
+NODE_DISPLAY_NAME_MAPPINGS = {"QwenAPILLMNode": "Qwen API (Lumi)"}
