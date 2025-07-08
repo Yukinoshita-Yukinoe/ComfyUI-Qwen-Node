@@ -28,14 +28,16 @@ except ImportError:
 
 # Helper function to convert ComfyUI image tensor to Base64 with optional resizing
 # 辅助函数：将 ComfyUI 图像张量转换为 Base64 编码字符串，并支持可选的图像缩放
-def comfy_image_to_base64(image_tensor: torch.Tensor, max_dimension: int = None) -> str:
+def comfy_image_to_base64(image_tensor: torch.Tensor, max_dimension: int = None, image_format: str = "PNG") -> str:
     """
     Converts a ComfyUI image tensor (batch, height, width, channels, float 0-1)
-    to a Base64 encoded PNG string, including the Data URI prefix.
+    to a Base64 encoded string, including the Data URI prefix.
     Optionally resizes the image if max_dimension is provided and exceeded.
+    image_format can be "PNG" or "JPEG".
     将 ComfyUI 图像张量（批次、高度、宽度、通道，浮点 0-1）
-    转换为 Base64 编码的 PNG 字符串，包括数据 URI 前缀。
+    转换为 Base64 编码字符串，包括数据 URI 前缀。
     如果提供了 max_dimension 并且图像尺寸超出，则可选地调整图像大小。
+    image_format 可以是 "PNG" 或 "JPEG"。
     """
     if image_tensor.ndim == 4:
         # Assuming batch size is 1 for single image input from a node
@@ -53,6 +55,9 @@ def comfy_image_to_base64(image_tensor: torch.Tensor, max_dimension: int = None)
     # Convert to PIL Image
     image_pil = Image.fromarray(image_tensor.cpu().numpy(), mode)
 
+    original_width, original_height = image_pil.size
+    print(f"[QwenAPILLMNode] Original image dimensions: {original_width}x{original_height}")
+
     # Resize image if max_dimension is specified and exceeded
     # Only resize if max_dimension is a positive number
     if max_dimension is not None and max_dimension > 0 and (image_pil.width > max_dimension or image_pil.height > max_dimension):
@@ -62,17 +67,24 @@ def comfy_image_to_base64(image_tensor: torch.Tensor, max_dimension: int = None)
         new_width = int(image_pil.width * ratio)
         new_height = int(image_pil.height * ratio)
         image_pil = image_pil.resize((new_width, new_height), Image.LANCZOS) # Use LANCZOS for high-quality downsampling
+        print(f"[QwenAPILLMNode] Resized image dimensions: {image_pil.width}x{image_pil.height}")
 
     # Save to BytesIO and base64 encode
     buffered = io.BytesIO()
-    image_pil.save(buffered, format="PNG") # PNG is a good default for base64
+    if image_format.upper() == "JPEG":
+        image_pil.save(buffered, format="JPEG", quality=85) # Use quality for JPEG
+        mime_type = "image/jpeg"
+    else: # Default to PNG
+        image_pil.save(buffered, format="PNG")
+        mime_type = "image/png"
+
     base64_string = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
     # Add debug print for base64 string length
-    print(f"[QwenAPILLMNode] Generated Base64 image string length: {len(base64_string)} characters")
+    print(f"[QwenAPILLMNode] Generated Base64 image string length ({mime_type}): {len(base64_string)} characters")
 
     # Prepend the Data URI scheme
-    return f"data:image/png;base64,{base64_string}"
+    return f"data:{mime_type};base64,{base64_string}"
 
 
 class QwenAPILLMNode:
@@ -116,9 +128,10 @@ class QwenAPILLMNode:
                 "max_retries": ("STRING", {"default": "1", "tooltip": "Maximum number of retries in case of API request failure.\nAPI请求失败时的最大重试次数。"}),
             },
             "optional": {
-                "image_input": ("IMAGE", {"tooltip": "Optional image input for multimodal models (e.g., qwen-vl-plus). Connect an image node here.\n用于多模态模型（如 qwen-vl-plus）的可选图像输入。请连接一个图像节点。"}),
+                "image_input": ("IMAGE", {"tooltip": "Optional image input for multimodal models (e.g., qwen-vl-plus). Connect an image node here. This image will be sent as Base64 data.\n用于多模态模型（如 qwen-vl-plus）的可选图像输入。请连接一个图像节点。此图像将作为Base64数据发送。"}),
                 "video_input_url": ("STRING", {"multiline": False, "default": "", "tooltip": "Optional video URL input for multimodal models (e.g., qwen-vl-max). Must be a publicly accessible URL. Leave empty if not used.\n用于多模态模型（如 qwen-vl-max）的可选视频URL输入。必须是可公开访问的URL。不使用时请留空。"}),
                 "max_image_dimension": ("INT", {"default": 1024, "min": 0, "max": 4096, "step": 64, "tooltip": "Maximum dimension (width or height) for image resizing before sending to API. Helps avoid 'String value length exceeds maximum allowed' errors. Set to 0 to disable resizing.\n发送到API之前图像缩放的最大尺寸（宽度或高度）。有助于避免“字符串值长度超出最大允许值”错误。设置为0表示禁用缩放。"}),
+                "image_output_format": (["PNG", "JPEG"], {"default": "PNG", "tooltip": "Format to use when encoding the image to Base64. JPEG is generally smaller but lossy.\n将图像编码为Base64时使用的格式。JPEG通常更小但有损。"}),
             }
         }
 
@@ -128,7 +141,7 @@ class QwenAPILLMNode:
     CATEGORY = "LLM/Qwen API" # You can change the category
     OUTPUT_NODE = True
 
-    def execute_qwen_request(self, api_key, model, prompt, system_message, temperature, top_p, max_tokens, seed, enable_search, enable_thinking, max_retries, image_input=None, video_input_url="", max_image_dimension=1024):
+    def execute_qwen_request(self, api_key, model, prompt, system_message, temperature, top_p, max_tokens, seed, enable_search, enable_thinking, max_retries, image_input=None, video_input_url="", max_image_dimension=1024, image_output_format="PNG"):
         # Ensure max_retries is an integer. ComfyUI sometimes passes empty string if input is cleared.
         if isinstance(max_retries, str) and not max_retries.strip():
             max_retries = 1
@@ -178,29 +191,28 @@ class QwenAPILLMNode:
 
         # Prepare user message content, supporting multimodal input
         user_content_parts = []
-        if prompt and prompt.strip():
-            user_content_parts.append({"text": prompt})
 
         is_multimodal_model = model in ["qwen-vl-plus", "qwen-vl-max"]
 
-        # Handle image input
+        # Handle image_input (ComfyUI tensor)
         if image_input is not None:
             if not is_multimodal_model:
                 return ("", False, f"Image input provided, but '{model}' is not a multimodal model (e.g., qwen-vl-plus). Please select a VL model.\n提供了图像输入，但 '{model}' 不是多模态模型（例如 qwen-vl-plus）。请选择一个VL模型。")
             try:
-                # Convert ComfyUI image tensor to Base64, with resizing and Data URI prefix
-                # Pass max_image_dimension to the helper function
-                image_data_uri = comfy_image_to_base64(image_input, max_dimension=max_image_dimension)
-                # Wrap the Data URI in a 'url' field within the 'image' object as required by Qwen-VL API
+                image_data_uri = comfy_image_to_base64(image_input, max_dimension=max_image_dimension, image_format=image_output_format)
                 user_content_parts.append({"image": {"url": image_data_uri}})
             except Exception as e:
-                return ("", False, f"Failed to process image input: {str(e)}\n处理图像输入失败：{str(e)}")
+                return ("", False, f"Failed to process image input from node: {str(e)}\n处理节点图像输入失败：{str(e)}")
 
-        # Handle video URL input
+        # Handle video URL input (still required as API expects URL for video)
         if video_input_url and video_input_url.strip():
             if not is_multimodal_model:
                 return ("", False, f"Video URL input provided, but '{model}' is not a multimodal model (e.g., qwen-vl-max). Please select a VL model.\n提供了视频URL输入，但 '{model}' 不是多模态模型（例如 qwen-vl-max）。请选择一个VL模型。")
             user_content_parts.append({"video": {"url": video_input_url}})
+
+        # Add the main text prompt last, as per documentation examples for mixed content
+        if prompt and prompt.strip():
+            user_content_parts.append({"text": prompt})
 
         # If no prompt and no media, return error or default to empty prompt
         if not user_content_parts:
@@ -336,10 +348,8 @@ if __name__ == "__main__":
         print(f"Status/Error: {status}")
         print(f"Generated Text:\n{text_output}")
 
-        # --- Test Case 2: Image input with a VL model (qwen-vl-plus) ---
-        print("\n--- Test Case 2: Image input (qwen-vl-plus) ---")
-        # Create a dummy image tensor for testing purposes
-        # In a real ComfyUI setup, this would come from an "IMAGE" input node
+        # --- Test Case 2: Image input with a VL model (qwen-vl-plus) - using ComfyUI tensor ---
+        print("\n--- Test Case 2: Image input (qwen-vl-plus) - using ComfyUI tensor ---")
         dummy_image_tensor = torch.zeros((1, 1500, 2000, 3), dtype=torch.float32) # Example: a 1500x2000 image
         text_output, success, status = node.execute_qwen_request(
             api_key=api_key_env,
@@ -355,7 +365,8 @@ if __name__ == "__main__":
             max_retries=1,
             image_input=dummy_image_tensor, # Pass the dummy tensor
             video_input_url="",
-            max_image_dimension=1024 # Image will be resized to fit within 1024x1024
+            max_image_dimension=1024, # Image will be resized to fit within 1024x1024
+            image_output_format="PNG"
         )
         print("\n--- Test Result 2 ---")
         print(f"Success: {success}")
@@ -364,8 +375,7 @@ if __name__ == "__main__":
 
         # --- Test Case 3: Video URL input with a VL model (qwen-vl-max) ---
         print("\n--- Test Case 3: Video URL input (qwen-vl-max) ---")
-        # Replace with a real, publicly accessible video URL for actual testing
-        dummy_video_url = "https://example.com/your_video.mp4"
+        dummy_video_url = "https://example.com/your_video.mp4" # Replace with a real, publicly accessible video URL for actual testing
         text_output, success, status = node.execute_qwen_request(
             api_key=api_key_env,
             model="qwen-vl-max",
