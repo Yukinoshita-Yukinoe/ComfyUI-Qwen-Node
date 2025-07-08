@@ -94,7 +94,8 @@ class QwenAPILLMNode:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2**32 - 1, "tooltip": "Seed for random number generation for reproducibility. 0 for random.\n用于可复现性的随机数种子。0表示随机。"}),
                 "enable_search": ("BOOLEAN", {"default": False, "tooltip": "Whether to enable internet search (only for models that support it, e.g., qwen-plus, qwen-turbo, qwen-max, qwen-plus-latest, qwen-max-latest). Check documentation.\n是否启用互联网搜索（仅适用于支持此功能的模型，例如 qwen-plus, qwen-turbo, qwen-max, qwen-plus-latest, qwen-max-latest）。请查阅文档。"}),
                 "enable_thinking": ("BOOLEAN", {"default": False, "tooltip": "Whether to enable the model's thinking process (only for models that support it and with streaming enabled). Current non-streaming implementation does NOT support this parameter. Check documentation.\n是否启用模型的思考过程（仅适用于支持此功能的模型且开启流式传输时）。当前非流式实现不支持此参数。请查阅文档。"}),
-                "max_retries": ("INT", {"default": 1, "min": 0, "max": 5, "step": 1, "tooltip": "Maximum number of retries in case of API request failure.\nAPI请求失败时的最大重试次数。"}),
+                # Changed type to STRING to handle potential empty string from ComfyUI UI
+                "max_retries": ("STRING", {"default": "1", "tooltip": "Maximum number of retries in case of API request failure.\nAPI请求失败时的最大重试次数。"}),
             },
             "optional": {
                 # Changed to IMAGE type for ComfyUI node connection
@@ -112,6 +113,7 @@ class QwenAPILLMNode:
 
     def execute_qwen_request(self, api_key, model, prompt, system_message, temperature, top_p, max_tokens, seed, enable_search, enable_thinking, max_retries, image_input=None, video_input_url=""):
         # Ensure max_retries is an integer. ComfyUI sometimes passes empty string if input is cleared.
+        # Now that INPUT_TYPES is STRING, we explicitly convert here.
         if isinstance(max_retries, str) and not max_retries.strip():
             max_retries = 1 # Default value if empty string is passed
         else:
