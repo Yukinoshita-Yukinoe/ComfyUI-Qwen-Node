@@ -4,6 +4,9 @@ import random
 import numpy as np
 import torch
 import requests # Required for making HTTP requests
+from PIL import Image
+import io
+import base64
 
 # 尝试从父目录导入工具函数，如果失败则使用本地/占位符版本
 # This attempts to import utility functions from a parent directory.
@@ -21,6 +24,36 @@ except ImportError:
     def ensure_env_file(): pass
     def get_api_key(service_name="DASHSCOPE_API_KEY"): # Qwen uses DASHSCOPE_API_KEY
         return os.getenv(service_name)
+
+# Helper function to convert ComfyUI image tensor to Base64
+# 辅助函数：将 ComfyUI 图像张量转换为 Base64 编码字符串
+def comfy_image_to_base64(image_tensor: torch.Tensor) -> str:
+    """
+    Converts a ComfyUI image tensor (batch, height, width, channels, float 0-1)
+    to a Base64 encoded PNG string.
+    将 ComfyUI 图像张量（批次、高度、宽度、通道，浮点 0-1）
+    转换为 Base64 编码的 PNG 字符串。
+    """
+    if image_tensor.ndim == 4:
+        # Assuming batch size is 1 for single image input from a node
+        image_tensor = image_tensor[0]
+
+    # Convert from 0-1 float to 0-255 uint8
+    image_tensor = (image_tensor * 255).byte()
+
+    # Determine image mode (RGB or RGBA)
+    if image_tensor.shape[2] == 4:
+        mode = "RGBA"
+    else:
+        mode = "RGB"
+
+    # Convert to PIL Image
+    image_pil = Image.fromarray(image_tensor.cpu().numpy(), mode)
+
+    # Save to BytesIO and base64 encode
+    buffered = io.BytesIO()
+    image_pil.save(buffered, format="PNG") # PNG is a good default for base64
+    return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 
 class QwenAPILLMNode:
@@ -61,9 +94,13 @@ class QwenAPILLMNode:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2**32 - 1, "tooltip": "Seed for random number generation for reproducibility. 0 for random.\n用于可复现性的随机数种子。0表示随机。"}),
                 "enable_search": ("BOOLEAN", {"default": False, "tooltip": "Whether to enable internet search (only for models that support it, e.g., qwen-plus, qwen-turbo, qwen-max, qwen-plus-latest, qwen-max-latest). Check documentation.\n是否启用互联网搜索（仅适用于支持此功能的模型，例如 qwen-plus, qwen-turbo, qwen-max, qwen-plus-latest, qwen-max-latest）。请查阅文档。"}),
                 "enable_thinking": ("BOOLEAN", {"default": False, "tooltip": "Whether to enable the model's thinking process (only for models that support it and with streaming enabled). Current non-streaming implementation does NOT support this parameter. Check documentation.\n是否启用模型的思考过程（仅适用于支持此功能的模型且开启流式传输时）。当前非流式实现不支持此参数。请查阅文档。"}),
-                "image_base64": ("STRING", {"multiline": True, "default": "", "tooltip": "Base64 encoded image data for multimodal models (e.g., qwen-vl-plus). Leave empty if not used.\n用于多模态模型（如 qwen-vl-plus）的Base64编码图像数据。不使用时请留空。"}),
-                "video_url": ("STRING", {"multiline": False, "default": "", "tooltip": "URL of the video for multimodal models (e.g., qwen-vl-max). Leave empty if not used.\n用于多模态模型（如 qwen-vl-max）的视频URL。不使用时请留空。"}),
                 "max_retries": ("INT", {"default": 1, "min": 0, "max": 5, "step": 1, "tooltip": "Maximum number of retries in case of API request failure.\nAPI请求失败时的最大重试次数。"}),
+            },
+            "optional": {
+                # Changed to IMAGE type for ComfyUI node connection
+                "image_input": ("IMAGE", {"tooltip": "Optional image input for multimodal models (e.g., qwen-vl-plus). Connect an image node here.\n用于多模态模型（如 qwen-vl-plus）的可选图像输入。请连接一个图像节点。"}),
+                # Kept as STRING, but clarified tooltip for URL requirement
+                "video_input_url": ("STRING", {"multiline": False, "default": "", "tooltip": "Optional video URL input for multimodal models (e.g., qwen-vl-max). Must be a publicly accessible URL. Leave empty if not used.\n用于多模态模型（如 qwen-vl-max）的可选视频URL输入。必须是可公开访问的URL。不使用时请留空。"}),
             }
         }
 
@@ -73,7 +110,7 @@ class QwenAPILLMNode:
     CATEGORY = "LLM/Qwen API" # You can change the category
     OUTPUT_NODE = True
 
-    def execute_qwen_request(self, api_key, model, prompt, system_message, temperature, top_p, max_tokens, seed, enable_search, enable_thinking, image_base64, video_url, max_retries):
+    def execute_qwen_request(self, api_key, model, prompt, system_message, temperature, top_p, max_tokens, seed, enable_search, enable_thinking, max_retries, image_input=None, video_input_url=""):
         # If API key is not provided directly, try to get it from environment variable
         # 如果未直接提供 API 密钥，则尝试从环境变量中获取
         if not api_key:
@@ -103,15 +140,22 @@ class QwenAPILLMNode:
 
         is_multimodal_model = model in ["qwen-vl-plus", "qwen-vl-max"]
 
-        if image_base64 and image_base64.strip():
+        # Handle image input
+        if image_input is not None:
             if not is_multimodal_model:
                 return ("", False, f"Image input provided, but '{model}' is not a multimodal model (e.g., qwen-vl-plus). Please select a VL model.\n提供了图像输入，但 '{model}' 不是多模态模型（例如 qwen-vl-plus）。请选择一个VL模型。")
-            user_content_parts.append({"image": image_base64})
+            try:
+                # Convert ComfyUI image tensor to Base64
+                image_base64_data = comfy_image_to_base64(image_input)
+                user_content_parts.append({"image": image_base64_data})
+            except Exception as e:
+                return ("", False, f"Failed to process image input: {str(e)}\n处理图像输入失败：{str(e)}")
 
-        if video_url and video_url.strip():
+        # Handle video URL input
+        if video_input_url and video_input_url.strip():
             if not is_multimodal_model:
-                return ("", False, f"Video input provided, but '{model}' is not a multimodal model (e.g., qwen-vl-max). Please select a VL model.\n提供了视频输入，但 '{model}' 不是多模态模型（例如 qwen-vl-max）。请选择一个VL模型。")
-            user_content_parts.append({"video": {"url": video_url}})
+                return ("", False, f"Video URL input provided, but '{model}' is not a multimodal model (e.g., qwen-vl-max). Please select a VL model.\n提供了视频URL输入，但 '{model}' 不是多模态模型（例如 qwen-vl-max）。请选择一个VL模型。")
+            user_content_parts.append({"video": {"url": video_input_url}})
 
         # If no prompt and no media, return error or default to empty prompt
         if not user_content_parts:
@@ -224,7 +268,7 @@ if __name__ == "__main__":
     else:
         node = QwenAPILLMNode()
 
-        # Example 1: Text-only request
+        # --- Test Case 1: Text-only request (qwen-turbo) ---
         print("\n--- Test Case 1: Text-only request (qwen-turbo) ---")
         text_output, success, status = node.execute_qwen_request(
             api_key=api_key_env,
@@ -237,21 +281,20 @@ if __name__ == "__main__":
             seed=12347,
             enable_search=False,
             enable_thinking=False,
-            image_base64="",
-            video_url="",
-            max_retries=1
+            max_retries=1,
+            image_input=None, # No image input for text-only model
+            video_input_url="" # No video input
         )
         print("\n--- Test Result 1 ---")
         print(f"Success: {success}")
         print(f"Status/Error: {status}")
         print(f"Generated Text:\n{text_output}")
 
-        # Example 2: Image input with a VL model (replace with actual base64 data for testing)
+        # --- Test Case 2: Image input with a VL model (qwen-vl-plus) ---
         print("\n--- Test Case 2: Image input (qwen-vl-plus) ---")
-        # Placeholder for a very small, valid base64 image (e.g., a 1x1 black pixel PNG)
-        # In a real scenario, you would load a real image and base64 encode it.
-        # Example base64 for a 1x1 black PNG: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=
-        dummy_image_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+        # Create a dummy image tensor for testing purposes
+        # In a real ComfyUI setup, this would come from an "IMAGE" input node
+        dummy_image_tensor = torch.zeros((1, 64, 64, 3), dtype=torch.float32) # 1x64x64 RGB black image
         text_output, success, status = node.execute_qwen_request(
             api_key=api_key_env,
             model="qwen-vl-plus",
@@ -263,18 +306,19 @@ if __name__ == "__main__":
             seed=0,
             enable_search=False,
             enable_thinking=False,
-            image_base64=dummy_image_base64,
-            video_url="",
-            max_retries=1
+            max_retries=1,
+            image_input=dummy_image_tensor, # Pass the dummy tensor
+            video_input_url=""
         )
         print("\n--- Test Result 2 ---")
         print(f"Success: {success}")
         print(f"Status/Error: {status}")
         print(f"Generated Text:\n{text_output}")
 
-        # Example 3: Video URL input with a VL model (replace with an actual video URL for testing)
+        # --- Test Case 3: Video URL input with a VL model (qwen-vl-max) ---
         print("\n--- Test Case 3: Video URL input (qwen-vl-max) ---")
-        dummy_video_url = "https://example.com/your_video.mp4" # Replace with a real video URL for testing
+        # Replace with a real, publicly accessible video URL for actual testing
+        dummy_video_url = "https://example.com/your_video.mp4"
         text_output, success, status = node.execute_qwen_request(
             api_key=api_key_env,
             model="qwen-vl-max",
@@ -286,16 +330,16 @@ if __name__ == "__main__":
             seed=0,
             enable_search=False,
             enable_thinking=False,
-            image_base64="",
-            video_url=dummy_video_url,
-            max_retries=1
+            max_retries=1,
+            image_input=None,
+            video_input_url=dummy_video_url # Pass the video URL string
         )
         print("\n--- Test Result 3 ---")
         print(f"Success: {success}")
         print(f"Status/Error: {status}")
         print(f"Generated Text:\n{text_output}")
 
-        # Example 4: Error case - Image input with a non-VL model
+        # --- Test Case 4: Error case - Image input with a non-VL model ---
         print("\n--- Test Case 4: Error - Image input with non-VL model (qwen-turbo) ---")
         text_output, success, status = node.execute_qwen_request(
             api_key=api_key_env,
@@ -308,9 +352,9 @@ if __name__ == "__main__":
             seed=0,
             enable_search=False,
             enable_thinking=False,
-            image_base64=dummy_image_base64,
-            video_url="",
-            max_retries=1
+            max_retries=1,
+            image_input=dummy_image_tensor, # Image input provided
+            video_input_url=""
         )
         print("\n--- Test Result 4 ---")
         print(f"Success: {success}")
