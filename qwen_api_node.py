@@ -111,6 +111,15 @@ class QwenAPILLMNode:
     OUTPUT_NODE = True
 
     def execute_qwen_request(self, api_key, model, prompt, system_message, temperature, top_p, max_tokens, seed, enable_search, enable_thinking, max_retries, image_input=None, video_input_url=""):
+        # Ensure max_retries is an integer. ComfyUI sometimes passes empty string if input is cleared.
+        if isinstance(max_retries, str) and not max_retries.strip():
+            max_retries = 1 # Default value if empty string is passed
+        else:
+            try:
+                max_retries = int(max_retries)
+            except ValueError:
+                return ("", False, "Invalid value for max_retries. Must be an integer.\nmax_retries 的值无效。必须是整数。")
+
         # If API key is not provided directly, try to get it from environment variable
         # 如果未直接提供 API 密钥，则尝试从环境变量中获取
         if not api_key:
@@ -232,7 +241,7 @@ class QwenAPILLMNode:
                      print(f"[QwenAPILLMNode] JSON Decode Error Response Text: {response.text}")
             except Exception as e:
                 error_msg = f"An unexpected error occurred: {str(e)}"
-                print(f"[QwenAPILLMNode] Unexpected error: {error_msg}")
+                print(f"[QwenAPILLMNode] Unexpected error: {e}")
 
 
             if attempt < max_retries:
