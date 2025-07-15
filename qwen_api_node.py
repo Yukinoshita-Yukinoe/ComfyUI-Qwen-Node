@@ -56,7 +56,7 @@ class QwenAPILLMNode:
     def INPUT_TYPES(s):
         # Updated model list based on the latest Aliyun documentation.
         model_list = [
-            "qwen-plus-latest", # Added model that supports 'thinking'
+            "qwen-plus-latest",
             "qwen-vl-max", 
             "qwen-vl-plus", 
             "qwen-max", 
@@ -70,14 +70,15 @@ class QwenAPILLMNode:
             "required": {
                 "api_key": ("STRING", {"default": "", "multiline": False, "dynamicPrompts": False}),
                 "model": (model_list, {"default": "qwen-plus-latest"}),
-                "prompt": ("STRING", {"default": "Solve this math problem: 1024 * 1024", "multiline": True, "dynamicPrompts": True}),
+                "prompt": ("STRING", {"default": "Hello, Qwen!", "multiline": True, "dynamicPrompts": True}),
                 "system_message": ("STRING", {"default": "You are a helpful assistant.", "multiline": True, "dynamicPrompts": False}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01}),
+                # --- Parameter order restored as per user request ---
+                "temperature": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "max_tokens": ("INT", {"default": 1500, "min": 1, "max": 8000, "step": 1}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "enable_search": ("BOOLEAN", {"default": False, "label_on": "enabled", "label_off": "disabled"}),
-                "enable_thinking": ("BOOLEAN", {"default": True, "label_on": "enabled", "label_off": "disabled"}), # Added thinking toggle
+                "enable_thinking": ("BOOLEAN", {"default": False, "label_on": "enabled", "label_off": "disabled"}),
                 "max_retries": ("INT", {"default": 1, "min": 1, "max": 5, "step": 1}),
             },
             "optional": {
@@ -90,7 +91,7 @@ class QwenAPILLMNode:
     FUNCTION = "execute_qwen_request"
     CATEGORY = "Lumi/LLM"
 
-    def execute_qwen_request(self, api_key, model, prompt, system_message, seed, temperature, top_p, max_tokens, enable_search, enable_thinking, max_retries, image_input=None):
+    def execute_qwen_request(self, api_key, model, prompt, system_message, temperature, top_p, max_tokens, seed, enable_search, enable_thinking, max_retries, image_input=None):
         final_api_key = api_key if api_key else get_api_key("DASHSCOPE_API_KEY")
         if not final_api_key:
             return ("", "API Key is missing.", False)
@@ -139,10 +140,8 @@ class QwenAPILLMNode:
             "parameters": params
         }
         
-        # --- Add 'tools' parameter if 'enable_thinking' is True for the correct model ---
         if enable_thinking and model == 'qwen-plus-latest':
             payload['tools'] = [{"type": "code_interpreter"}]
-            # 'result_format' must be 'message' when using tools
             payload['parameters']['result_format'] = 'message'
 
         for attempt in range(max_retries):
@@ -152,34 +151,47 @@ class QwenAPILLMNode:
                     response.raise_for_status()
                     response_data = response.json()
                     
-                    if "output" not in response_data or "choices" not in response_data["output"] or not response_data["output"]["choices"]:
-                        error_code = response_data.get("code", "UnknownError")
-                        error_msg = response_data.get("message", "Invalid response structure from API.")
-                        raise Exception(f"API Error [{error_code}]: {error_msg}")
-
-                    content_list = response_data["output"]["choices"][0]["message"]["content"]
                     generated_text = ""
-                    if isinstance(content_list, list):
-                        for item in content_list:
-                            if "text" in item:
-                                generated_text = item["text"]
-                                break
-                    elif isinstance(content_list, str):
-                         generated_text = content_list
+                    # --- FIX: Handle both 'message' and 'text' response formats ---
+                    output = response_data.get("output", {})
+                    
+                    # Case 1: Handle 'message' format (for VL models and tools)
+                    if "choices" in output and output["choices"]:
+                        content_list = output["choices"][0].get("message", {}).get("content", [])
+                        if isinstance(content_list, list):
+                            for item in content_list:
+                                if "text" in item:
+                                    generated_text = item["text"]
+                                    break
+                        elif isinstance(content_list, str): # Fallback for simple string content
+                             generated_text = content_list
+                        
+                        # Handle case where a tool was used but no text was returned
+                        if not generated_text and output["choices"][0].get("finish_reason") == "tool_calls":
+                            generated_text = "Model used a tool (e.g. Code Interpreter). Check logs for details."
 
-                    if not generated_text and response_data["output"]["choices"][0].get("finish_reason") == "tool_calls":
-                        generated_text = "Model used a tool (e.g. Code Interpreter). Check logs for details."
-                    elif not generated_text:
-                         raise Exception("No text content found in the response.")
+                    # Case 2: Handle simple 'text' format (for standard text models)
+                    elif "text" in output:
+                        generated_text = output["text"]
+
+                    # If no text could be extracted, raise an error
+                    if not generated_text:
+                        raise Exception("No valid text content found in the API response.")
 
                     status_message = f"Success (HTTP {response.status_code})"
                     print(f"[QwenAPILLMNode] {status_message}")
                     return (generated_text, status_message, True)
 
-            except requests.exceptions.RequestException as e:
-                status_code = e.response.status_code if e.response is not None else "N/A"
-                error_text = e.response.text if e.response is not None else str(e)
-                error_message = f"Request failed with status {status_code}. Response: {error_text}"
+            except Exception as e:
+                # Improved error logging
+                error_message = f"!!! Exception during processing !!! {type(e).__name__}: {e}"
+                try:
+                    # Try to get more specific error from API response if possible
+                    error_text = response.text
+                    error_message = f"Request failed with status {response.status_code}. Response: {error_text}"
+                except:
+                    pass
+                
                 print(f"[QwenAPILLMNode] {error_message}")
                 
                 if attempt + 1 < max_retries:
